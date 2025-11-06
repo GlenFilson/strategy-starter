@@ -1,5 +1,11 @@
 import WebSocket from "ws";
 import Decimal from "decimal.js";
+import "dotenv/config";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import bs58 from "bs58";
+import { createExecutor } from "./exec.js";
+import fs from "fs";
+import path from "path";
 
 const ASSET = "SOL";
 //https://docs.pyth.network/price-feeds/core/price-feeds/price-feed-ids for price feed ids
@@ -12,12 +18,117 @@ const ws = new WebSocket(WS_URL); //creates a new websocket connection to Pyth
 function log(message) {
   console.log(`[${new Date().toISOString()}] ${message}`);
 }
+// Keep output concise; set LOG_LEVEL=debug for verbose
+const LOG_LEVEL = process.env.LOG_LEVEL || "info";
+function debug(message) {
+  if (LOG_LEVEL === "debug") log(message);
+}
 //NOTE: CANDLESTICK_DURATION and CANDLESTICK_INTERVAL should match each other
 const CANDLESTICK_DURATION = 1000 * 1; //milliseconds (1000 * X = X seconds)
 //https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints refer for intervals for binance api
 const CANDLESTICK_INTERVAL = "1s"; //for the binance api
 const SYMBOL = "SOLUSDT"; //for the binance api
 const CANDLESTICK_WINDOW_SIZE = 20; //how many candlesticks to keep track of
+
+const SLIPPAGE_BPS = 50; // try 0.50% to reduce slippage failures
+// Trade size: percent of portfolio notional (e.g., 0.2 = 20%)
+const TRADE_PCT = 0.2;
+const PRIORITY_FEE_LAMPORTS = 50000; // raise for fewer CU/priority failures
+const ONLY_DIRECT_ROUTES = false; // allow routed paths for better reliability
+
+const MINTS = {
+  WSOL: "So11111111111111111111111111111111111111112",
+  USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+};
+
+// Static infra for execution
+const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
+const JUP_BASE = "https://lite-api.jup.ag";
+const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
+
+function keypairFromEnv(privateKey) {
+  if (!privateKey) throw new Error("Missing PRIVATE_KEY");
+  try {
+    const decoded = bs58.decode(privateKey);
+    return Keypair.fromSecretKey(decoded);
+  } catch (_) {
+    const arr = JSON.parse(privateKey);
+    const u8 = Uint8Array.from(arr);
+    return Keypair.fromSecretKey(u8);
+  }
+}
+
+const connection = new Connection(RPC_URL, "confirmed");
+let wallet = null;
+try {
+  wallet = keypairFromEnv(PRIVATE_KEY);
+} catch (_) {
+  wallet = null; // dry mode if not configured
+}
+// create execution helper
+const executor = wallet
+  ? createExecutor({
+      connection,
+      wallet,
+      jupBase: JUP_BASE,
+      priorityFeeLamports: PRIORITY_FEE_LAMPORTS,
+      onlyDirectRoutes: ONLY_DIRECT_ROUTES,
+    })
+  : null;
+
+// -------- Portfolio-based sizing helpers --------
+const USDC_DECIMALS = 6;
+const WSOL_DECIMALS = 9;
+const FEE_RESERVE_LAMPORTS = 2_000_000; // keep ~0.002 SOL for fees
+
+async function getSolBalanceLamports(pubkey) {
+  try {
+    return await connection.getBalance(pubkey, "confirmed");
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function getUsdcBalanceAtomic(pubkey) {
+  try {
+    const resp = await connection.getParsedTokenAccountsByOwner(
+      pubkey,
+      { mint: new PublicKey(MINTS.USDC) },
+      "confirmed"
+    );
+    let total = 0n;
+    for (const acc of resp.value) {
+      const amountStr = acc.account.data.parsed.info.tokenAmount.amount;
+      total += BigInt(amountStr);
+    }
+    return Number(total);
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function getBalances(pubkey) {
+  const [lamports, usdcAtomic] = await Promise.all([
+    getSolBalanceLamports(pubkey),
+    getUsdcBalanceAtomic(pubkey),
+  ]);
+  return { lamports, usdcAtomic };
+}
+
+function computeAmountAtomic({ isBuy, balances, solUsd, tradePct }) {
+  const solAvail =
+    Math.max(0, balances.lamports - FEE_RESERVE_LAMPORTS) / 10 ** WSOL_DECIMALS;
+  const usdcAvail = balances.usdcAtomic / 10 ** USDC_DECIMALS;
+  const totalUsd = usdcAvail + solAvail * solUsd;
+  const tradeUsd = totalUsd * Number(tradePct);
+  if (tradeUsd <= 0) return 0;
+  if (isBuy)
+    return Math.floor(Math.min(tradeUsd, usdcAvail) * 10 ** USDC_DECIMALS);
+  const wantSol = tradeUsd / solUsd;
+  return Math.floor(
+    Math.max(0, Math.min(wantSol, solAvail)) * 10 ** WSOL_DECIMALS
+  );
+}
 
 class Candle {
   constructor(timestamp, open, high, low, close) {
@@ -42,6 +153,8 @@ const indicators = {
   rsi14: null,
   bollingerBands: null,
 };
+
+// No executor object; we call executeSwap directly
 
 //async to wait for historical candles
 ws.onopen = async () => {
@@ -83,7 +196,7 @@ ws.onmessage = (event) => {
   onTick(price, timestamp);
 };
 
-function onTick(price, timestamp) {
+async function onTick(price, timestamp) {
   const candleClosed = updateCandles(price, timestamp);
   //can choose when to update indicators, every tick or every candle close
   let signal = null;
@@ -92,14 +205,165 @@ function onTick(price, timestamp) {
     updateIndicators();
     signal = generateSignal(price);
   } else {
-    signal = generateSignal(price);
+    // signal = generateSignal(price);
   }
   //logic to handle signals here
   if (signal) {
-    log(`Signal: ${signal.signal} @ $${signal.price}`);
+    log(`Signal ${signal.signal} @ $${price}`);
+    // Execute swap if configured with an explicit amount
+    if (wallet) {
+      const isBuy = signal.signal === "BUY";
+      log(`Sizing: pct=${TRADE_PCT}`);
+      const balances = await getBalances(wallet.publicKey);
+      const amountAtomic = computeAmountAtomic({
+        isBuy,
+        balances,
+        solUsd: price.toNumber(),
+        tradePct: TRADE_PCT,
+      });
+      if (!amountAtomic || amountAtomic <= 0) {
+        log("Trade skipped: computed size is 0 atoms");
+        appendTradeLog({
+          side: isBuy ? "BUY" : "SELL",
+          priceUsd: price.toNumber(),
+          inputMint: isBuy ? MINTS.USDC : MINTS.WSOL,
+          outputMint: isBuy ? MINTS.WSOL : MINTS.USDC,
+          amountAtomic: 0,
+          slippageBps: SLIPPAGE_BPS,
+          tradePct: TRADE_PCT,
+          signature: "",
+          status: "skipped",
+          error: "size=0",
+        });
+        return;
+      }
+      executor
+        ?.executeSwap({
+          inputMint: isBuy ? MINTS.USDC : MINTS.WSOL,
+          outputMint: isBuy ? MINTS.WSOL : MINTS.USDC,
+          amountAtomic,
+          slippageBps: SLIPPAGE_BPS,
+        })
+        .then((res) => {
+          log(
+            `Swap submitted: ${
+              isBuy ? "USDC→WSOL" : "WSOL→USDC"
+            } amt=${amountAtomic} atoms slippage=${SLIPPAGE_BPS}bps sig=${
+              res.signature
+            }`
+          );
+          appendTradeLog({
+            side: isBuy ? "BUY" : "SELL",
+            priceUsd: price.toNumber(),
+            inputMint: isBuy ? MINTS.USDC : MINTS.WSOL,
+            outputMint: isBuy ? MINTS.WSOL : MINTS.USDC,
+            amountAtomic,
+            slippageBps: SLIPPAGE_BPS,
+            tradePct: TRADE_PCT,
+            signature: res.signature,
+            status: "submitted",
+            error: "",
+          });
+        })
+        .catch((err) => {
+          const msg = shortErrMessage(err);
+          log(`Swap failed: ${msg}`);
+          if (LOG_LEVEL === "debug") {
+            debug(String(err?.stack || err?.message || err));
+          }
+          appendTradeLog({
+            side: isBuy ? "BUY" : "SELL",
+            priceUsd: price.toNumber(),
+            inputMint: isBuy ? MINTS.USDC : MINTS.WSOL,
+            outputMint: isBuy ? MINTS.WSOL : MINTS.USDC,
+            amountAtomic,
+            slippageBps: SLIPPAGE_BPS,
+            tradePct: TRADE_PCT,
+            signature: "",
+            status: "failed",
+            error: msg,
+          });
+        });
+    } else {
+      // Either execution disabled or amount not configured; skip on-chain action
+    }
   } else {
     // log("NO SIGNAL");
   }
+}
+
+function shortErrMessage(err) {
+  const raw = err && err.message ? err.message : String(err);
+  const idx = raw.indexOf("Logs:");
+  if (idx > 0) return raw.slice(0, idx).trim();
+  const firstLine = raw.split("\n")[0];
+  return firstLine.trim();
+}
+
+// -------- CSV trade logging --------
+const TRADE_LOG_PATH = path.resolve(process.cwd(), "trades.csv");
+function ensureTradeLogHeader() {
+  if (!fs.existsSync(TRADE_LOG_PATH)) {
+    const header =
+      [
+        "timestamp",
+        "side",
+        "priceUsd",
+        "inputMint",
+        "outputMint",
+        "amountAtomic",
+        "amountInput",
+        "amountUsd",
+        "slippageBps",
+        "tradePct",
+        "signature",
+        "status",
+        "error",
+      ].join(",") + "\n";
+    fs.writeFileSync(TRADE_LOG_PATH, header, { encoding: "utf8" });
+  }
+}
+
+function appendTradeLog({
+  side,
+  priceUsd,
+  inputMint,
+  outputMint,
+  amountAtomic,
+  slippageBps,
+  tradePct,
+  signature,
+  status,
+  error,
+}) {
+  ensureTradeLogHeader();
+  const ts = new Date().toISOString();
+  // derive human amounts and usd
+  let amountInput = 0;
+  if (inputMint === MINTS.USDC) {
+    amountInput = amountAtomic / 10 ** 6;
+  } else if (inputMint === MINTS.WSOL) {
+    amountInput = amountAtomic / 10 ** 9;
+  }
+  const amountUsd =
+    inputMint === MINTS.USDC ? amountInput : amountInput * Number(priceUsd);
+  const row =
+    [
+      ts,
+      side,
+      Number(priceUsd).toFixed(6),
+      inputMint,
+      outputMint,
+      amountAtomic,
+      amountInput.toFixed(9),
+      amountUsd.toFixed(6),
+      slippageBps,
+      tradePct,
+      signature || "",
+      status,
+      (error || "").replace(/\s+/g, " "),
+    ].join(",") + "\n";
+  fs.appendFileSync(TRADE_LOG_PATH, row, { encoding: "utf8" });
 }
 
 function updateIndicators() {
@@ -113,7 +377,6 @@ function updateIndicators() {
 
 function generateSignal(price) {
   if (indicators.rsi14 === null || indicators.bollingerBands === null) {
-    log("INDICATORS ARE NULL");
     return null;
   }
 
@@ -199,9 +462,21 @@ async function fetchHistoricalCandles(
     //can change logic here to do whatever we want with the candle data
     candles.push(candle);
   }
-  log("Timestamp - Open - High - Low - Close");
-  for (const candle of candles) {
-    log(candle.toString());
+  debug("Timestamp - Open - High - Low - Close");
+  if (LOG_LEVEL === "debug") {
+    for (const candle of candles) {
+      log(candle.toString());
+    }
+  } else if (candles.length > 0) {
+    const first = candles[0];
+    const last = candles[candles.length - 1];
+    log(
+      `Seeded ${candles.length} candles | first ${
+        first.timestamp
+      } o:${first.open.toFixed(4)} c:${first.close.toFixed(4)} | last ${
+        last.timestamp
+      } o:${last.open.toFixed(4)} c:${last.close.toFixed(4)}`
+    );
   }
 }
 
