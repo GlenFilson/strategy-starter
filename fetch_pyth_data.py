@@ -103,10 +103,10 @@ def save_to_csv(df, filename):
 
 
 if __name__ == "__main__":
-    SYMBOL = "Crypto.ETH/USD"
+    SYMBOL = "Crypto.SOL/USD"
     INTERVAL = '1h'
     DAYS_BACK = 365 * 5
-    OUTPUT_FILE = f'ETH_{INTERVAL}_data.csv'
+    OUTPUT_FILE = f'SOL_{INTERVAL}_data.csv'
     
     print("=" * 60)
     print("Pyth Historical Data Fetcher (OHLC only)")
