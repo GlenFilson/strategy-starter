@@ -28,7 +28,7 @@ Feel free to replace or extend anything. The judging panel cares most about your
 
 - Node.js 18+ and npm
 - Python 3.10+ (for data collection and backtesting utilities)
-- A Solana wallet funded with sufficient SOL (trading float + fees)
+- A Solana wallet (the competition team will fund approved submissions for live trading; self-fund only if you want to test independently)
 - A Pyth WebSocket-compatible RPC endpoint (default uses `https://api.mainnet-beta.solana.com`)
 
 ---
@@ -48,7 +48,7 @@ Feel free to replace or extend anything. The judging panel cares most about your
    node generateWallet.js
    ```
 
-   The script writes `new-wallet.json` containing your secret key. Fund the public address with SOL before live trading.
+   The script writes `new-wallet.json` containing your secret key. Keep this safe—once you submit, the organizers will fund the wallet before the live run. You may self-fund with small amounts only if you want to test on your own beforehand.
 
 3. **Create an environment file**
    Create `.env` in the project root with:
@@ -124,6 +124,6 @@ Feel free to replace or extend anything. The judging panel cares most about your
 
 ## Support
 
-Questions? Contact either society via the emails or social channels shared in the competition announcement. Please mention “Trading Bot Competition” in the subject line for faster routing.
+Questions? Contact either society via the emails or social channels shared in the competition announcement. The quickest responses come through the Building Division WhatsApp channel—mention “Trading Bot Competition” so we can route your request fast.
 
 Good luck, and happy building!
